@@ -230,7 +230,112 @@ class MotifProfile:
         return consensus_string
 
 
+    # =-=-=-=-=-=-=-=-=-=-=-=-= TASK 3 =-=-=-=-=-=-=-=-=-=-=-=-=
+import itertools
+import random
+from Bio import SeqIO
+from Bio import motifs
+from Bio.Seq import Seq
 
+class MotifFinder:
+    def __init__(self, sequences, l, seed=None):
+        """
+        Initialise the finder with seqs, motif length (l), and sets
+        up a private random number generator and pre-sliced sliding windows.
+        :param sequences:
+        :param l:
+        :param seed:
+        """
+
+        self.sequences = sequences
+        self.l = l
+        self.rng = random.Random(42)
+
+        # Precalculating all l-mers for every seq so repeated slicing is avoided
+        self.windows = []
+        for seq in sequences:
+            # Creating a list of all l-mers in this spec sequence
+            seq_windows = [seq[i:i+self.l] for i in range(len(seq) - self.l +1)]
+            self.windows.append(seq_windows)
+
+
+    def total_distance(self, pattern):
+        """
+        Calcs the total distance using the pre-sliced self.windows
+        :param pattern:
+        :return:
+        """
+        total_dist = 0
+        for seq_windows in self.windows:
+            # Find the minimum Hamming distance between the pattern and all windows in this seq
+            # hamming -> from Task1
+            min_dist = min(hamming_distance(pattern, w) for w in seq_windows)
+            total_dist += min_dist
+        return total_dist
+
+    def median_string(self):
+        """
+        The EXACT algorithm: tests all 4^l possible patterns to find the one
+        with the smallest total distance to our sequences.
+        """
+        best_distance = float('inf')
+        best_pattern = ""
+
+        # itertools.product generates all possible combinations of ACGT of length l
+        for combo in itertools.product("ACGT", repeat=self.l):
+            # combo is a tuple like ('A', 'C', 'G'), so we join it into a string "ACG"
+            pattern = "".join(combo)
+            dist = self.total_distance(pattern)
+
+            if dist < best_distance:
+                best_distance = dist
+                best_pattern = pattern
+
+        return best_pattern, best_distance
+
+    def randomized_search(self):
+        """
+        The HEURISTIC algorithm: picks random starting points, builds a profile,
+        and iteratively improves it until it stops getting better.
+        """
+        # 1. Pick a random l-mer in every sequence to form our initial motifs
+        current_motifs = [self.rng.choice(seq_windows) for seq_windows in self.windows]
+
+        # score() is reused from Task 1
+        current_score = score(current_motifs)
+
+        while True:
+            # 2. Build a profile from the current motifs (pseudocount = 1)
+            profile = MotifProfile(current_motifs, pseudocount=1)
+
+            # 3. Find the most probable l-mer in every sequence using this new profile
+            new_motifs = [profile.most_probable_lmer(seq) for seq in self.sequences]
+            new_score = score(new_motifs)
+
+            # 4. If the score improved, keep the new motifs and loop again.
+            if new_score > current_score:
+                current_motifs = new_motifs
+                current_score = new_score
+            else:
+                # If we didn't improve, we've reached a local maximum. Stop and return.
+                return current_motifs, current_score
+
+    def best_of(self, runs):
+        """
+        Runs randomized_search multiple times and returns the best overall result.
+        Because randomized_search can get stuck in "local maximums", restarting
+        it from scratch many times improves our chances of finding the true motif.
+        """
+        best_motifs = []
+        best_overall_score = -1
+
+        for _ in range(runs):
+            motifs, run_score = self.randomized_search()
+            if run_score > best_overall_score:
+                best_overall_score = run_score
+                best_motifs = motifs
+
+        return best_motifs, best_overall_score
 
 def main():
     lecture_dna = [
@@ -269,6 +374,66 @@ def main():
     print(bio.consensus)  # ATGCGTA
     print(bio.pwm["A"])  # the same numbers as your profile.ppm["A"]
 
+    # =-=-=-=-=-=-=-=-=-=-=-=-= TASK 3 =-=-=-=-=-=-=-=-=-=-=-=-=
+
+    lecture_finder = MotifFinder(lecture_dna, 6, seed=1)
+
+    med_pat, med_dist = lecture_finder.median_string()
+    print(f"Median String: {med_pat} (Distance: {med_dist})")  # Expected: AGATAG, 2
+
+    best_m, best_s = lecture_finder.best_of(100)
+    print(f"Randomized (best of 100): {consensus(best_m)} (Score: {best_s})")  # Expected: AGATAG, 34
+
+    # Planted motif search
+    try:
+        # Load sequences from the FASTA file
+        planted_seqs = [str(record.seq) for record in SeqIO.parse("planted_motif.fasta", "fasta")]
+
+        finder = MotifFinder(planted_seqs, 7, seed=42)
+
+
+        print("Running median_string() ... (may take a while)")
+        planted_med_pat, planted_med_dist = finder.median_string()
+        print(f"Median String: {planted_med_pat} (Distance: {planted_med_dist})")
+
+        print("Running best_of(100) ...")
+        best_motifs, best_score = finder.best_of(100)
+        found_consensus = consensus(best_motifs)
+        print(f"Best of 100 Consensus: {found_consensus} (Score: {best_score})")
+        print("Do they agree?", planted_med_pat == found_consensus)
+
+        # Scanning with PSSM
+        # Building the Biopython motif from best results
+        found = motifs.create([Seq(m) for m in best_motifs])
+        found.pseudocounts = 1
+        pssm = found.pssm
+
+        # Testing 1% and 0.1% False Positive Rates
+        for fpr in [0.01, 0.001]:
+            threshold = pssm.distribution().threshold_fpr(fpr)
+
+            total_hits = 0
+            reverse_hits = 0
+            found_sites_among_them = 0
+
+            for i, seq in enumerate(planted_seqs):
+                for position, hit_score in pssm.search(Seq(seq), threshold=threshold):
+                    total_hits += 1
+
+                    if position < 0:
+                        reverse_hits += 1
+                    else:
+                        # Checking if this forward hit is exactly the l-mer best_of() picked for this sequence
+                        if seq[position:position + 7] == best_motifs[i]:
+                            found_sites_among_them += 1
+
+            print(f"FPR: {fpr} (Threshold: {threshold:.2f})")
+            print(f"  Total hits: {total_hits}")
+            print(f"  Reverse strand hits: {reverse_hits}")
+            print(f"  Actual found sites among them: {found_sites_among_them}")
+
+    except FileNotFoundError:
+        print("Could not find 'planted_motif.fasta'. Make sure it's in the same folder!")
 
 if __name__ == "__main__":
     main()
